@@ -1,4 +1,4 @@
-module github.com/jonaharagon/caddy-umami
+module github.com/zeepkist/caddy-umami
 
 go 1.22.1
 

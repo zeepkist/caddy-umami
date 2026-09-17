@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 
@@ -45,7 +46,6 @@ func init() {
 //	    trusted_ip_header X-Forwarded-For
 //	    cookie_resolution umami_resolution
 //	    device_detection
-//	    cookie_consent umami_consent disable_all
 //	    static_metadata {
 //	        server node1
 //	    }
@@ -107,14 +107,6 @@ type Umami struct {
 	// # Example (Caddyfile)
 	//  device_detection
 	DeviceDetection bool `json:"device_detection,omitempty"`
-	// A map of cookie-based consent settings. Only the first value in the map is utilized currently.
-	// Specify the name of a cookie, then:
-	// You can set the behavior to "disable_all" to disable sending analytics if the cookie value is "false",
-	// or "path_only" to send analytic data without client information (IP, user agent, etc.) if the cookie value is "false".
-	//
-	// # Example (Caddyfile)
-	//  cookie_consent umami_consent disable_all
-	CookieConsent []CookieConsent `json:"cookie_consent,omitempty"`
 	// Optional static metadata to include with each event via query string.
 	// You can include multiple key value pairs, each will be appended as a separate query string.
 	//
@@ -125,15 +117,6 @@ type Umami struct {
 	StaticMetadata []StaticMetadata `json:"static_metadata,omitempty"`
 
 	logger *zap.Logger
-}
-
-type CookieConsent struct {
-	// The name of the cookie that stores the consent setting.
-	Name string `json:"name,omitempty"`
-	// Can be "disable_all" to disable sending analytics if the cookie value is "false",
-	// or "path_only" to send analytic data without client information (IP, user agent, etc.) if the cookie value is "false".
-	// Defaults to "disable_all" if not specified.
-	Behavior string `json:"behavior,omitempty"`
 }
 
 type StaticMetadata struct {
@@ -159,12 +142,6 @@ func (p Umami) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 	err := next.ServeHTTP(w, r)
 	if err != nil {
 		return err
-	}
-
-	// Check if analytics should be performed based on cookie consent settings.
-	p.logger.Debug("Check if analytics should be performed:", zap.Int("allowed", p.GetAllowed(r)))
-	if p.GetAllowed(r) == 0 {
-		return nil
 	}
 
 	// Normalize request path.
@@ -195,8 +172,9 @@ func (p Umami) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 
 	// Send visitor information to the Umami Events REST API endpoint.
 	go func() {
-		// Get request query strings.
-		queryStrings := r.URL.Query()
+		// Never copy incoming query parameters into analytics data. Static metadata is
+		// configuration-controlled and is the only query data sent to Umami.
+		queryStrings := make(url.Values)
 
 		// Add optional metadata to query strings.
 		for _, metadata := range p.StaticMetadata {
@@ -212,7 +190,7 @@ func (p Umami) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 			requestPath = "/" + requestPath
 		}
 
-		// Preserve query strings.
+		// Append configuration-controlled metadata.
 		if queryString != "" {
 			requestPath = fmt.Sprintf("%s?%s", requestPath, queryString)
 			p.logger.Debug("Request Path", zap.String("requestPath", requestPath))
@@ -231,10 +209,7 @@ func (p Umami) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 			"hostname": hostname,
 		}
 
-		// Add client information if allowed by cookie.
-		if p.GetAllowed(r) == 1 {
-			p.GetClientInfo(r, payload)
-		}
+		p.GetClientInfo(r, payload)
 
 		visitorInfo := map[string]interface{}{
 			"payload": payload,
@@ -258,12 +233,7 @@ func (p Umami) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 
 		req.Header.Set("Content-Type", "application/json")
 
-		// Use fake user agent if analytics is disabled.
-		if p.GetAllowed(r) == 1 {
-			req.Header.Set("User-Agent", r.UserAgent())
-		} else {
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Unknown) Browser/1.0 (Anonymous Request)")
-		}
+		req.Header.Set("User-Agent", r.UserAgent())
 
 		// Set client IP address in headers.
 		req.Header.Set("X-Forwarded-For", visitorIP)
@@ -300,40 +270,8 @@ func (p Umami) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 	return nil
 }
 
-// Check whether analytics should be performed based on cookie consent settings.
-//   - 0 - no analytics
-//   - 1 - all analytics
-//   - 2 - only path analytics
-func (p *Umami) GetAllowed(r *http.Request) int {
-	// Only the first value in the map is utilized currently.
-	if len(p.CookieConsent) != 0 {
-		if p.CookieConsent[0].Behavior == "path_only" {
-			cookie, err := r.Cookie(p.CookieConsent[0].Name)
-			if err == nil && cookie != nil && cookie.Value == "true" {
-				p.logger.Debug("Cookie allows analytics")
-				return 1
-			} else {
-				p.logger.Debug("Cookie does not allow analytics, sending path only")
-				return 2
-			}
-		} else if p.CookieConsent[0].Behavior == "disable_all" {
-			cookie, err := r.Cookie(p.CookieConsent[0].Name)
-			if err == nil && cookie != nil && cookie.Value == "true" {
-				p.logger.Debug("Cookie allows analytics")
-				return 1
-			} else {
-				p.logger.Debug("Cookie does not allow analytics, sending no analytics")
-				return 0
-			}
-		}
-	}
-	p.logger.Debug("Cookie check disabled, sending all analytics")
-	return 1
-}
-
 // Get the client IP address from the request.
 // If a trusted IP header is provided, use that instead.
-// If the client opted-out, replace the IP address with a psuedo Class E IP address.
 func (p *Umami) GetClientIP(r *http.Request) string {
 	visitorIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -347,10 +285,6 @@ func (p *Umami) GetClientIP(r *http.Request) string {
 		} else {
 			p.logger.Debug("Invalid IP address provided by trusted IP header", zap.String("IP", trustedIP))
 		}
-	}
-	// anonymize IP based on consent cookie
-	if p.GetAllowed(r) != 1 {
-		visitorIP = "240.16.0.1"
 	}
 	p.logger.Debug("Returning visitor IP to umami:", zap.String("IP", visitorIP))
 	return visitorIP
@@ -435,26 +369,6 @@ func (p *Umami) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				p.TrustedIPHeader = d.Val()
-			case "cookie_consent":
-				// defaults
-				if !d.NextArg() {
-					p.CookieConsent = append(p.CookieConsent, CookieConsent{Name: "umami_consent", Behavior: "disable_all"})
-				} else {
-					// if behavior specified
-					if d.Val() == "disable_all" || d.Val() == "path_only" {
-						behavior := d.Val()
-						if !d.NextArg() {
-							// if cookie unspecified
-							p.CookieConsent = append(p.CookieConsent, CookieConsent{Name: "umami_consent", Behavior: behavior})
-						} else {
-							// if behavior + cookie specified
-							p.CookieConsent = append(p.CookieConsent, CookieConsent{Name: d.Val(), Behavior: behavior})
-						}
-					} else {
-						// if behavior unspecified + cookie specified
-						p.CookieConsent = append(p.CookieConsent, CookieConsent{Name: d.Val(), Behavior: "disable_all"})
-					}
-				}
 			case "cookie_resolution":
 				if !d.NextArg() {
 					p.CookieResolution = "umami_resolution"
@@ -521,7 +435,6 @@ func ParseCaddyfileStaticMetadata(d *caddyfile.Dispenser) ([]StaticMetadata, err
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var umami Umami
 	umami.AllowedExtensions = []string{}
-	umami.CookieConsent = []CookieConsent{}
 	err := umami.UnmarshalCaddyfile(h.Dispenser)
 	if err != nil {
 		return nil, err
@@ -544,7 +457,6 @@ func (p *Umami) Validate() error {
 	p.logger.Debug("Client IP Header: " + p.ClientIPHeader)
 	p.logger.Debug("Trusted IP Header: " + p.TrustedIPHeader)
 	p.logger.Debug("Report All Resources: " + fmt.Sprint(p.ReportAllResources))
-	p.logger.Debug("Cookie Consent: " + fmt.Sprint(p.CookieConsent))
 	p.logger.Debug("Cookie Resolution: " + p.CookieResolution)
 	p.logger.Debug("Device Detection: " + fmt.Sprint(p.DeviceDetection))
 	p.logger.Debug("Static Metadata: " + fmt.Sprint(p.StaticMetadata))
