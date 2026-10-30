@@ -2,6 +2,7 @@ package caddyumami
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 type testHandler func(http.ResponseWriter, *http.Request) error
@@ -124,6 +126,77 @@ func TestServeHTTPStripsIncomingQueryAndIgnoresConsentCookie(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for Umami event")
+	}
+}
+
+func TestServeHTTPDoesNotFollowAnalyticsRedirects(t *testing.T) {
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		for _, sameServer := range []bool{false, true} {
+			t.Run(fmt.Sprintf("status=%d/same_server=%t", status, sameServer), func(t *testing.T) {
+				targetRequests := make(chan string, 1)
+				target := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					targetRequests <- r.Method
+					w.WriteHeader(http.StatusInternalServerError)
+				})
+				targetServer := httptest.NewServer(target)
+				defer targetServer.Close()
+
+				eventRequests := make(chan string, 1)
+				eventServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/admin" {
+						target(w, r)
+						return
+					}
+					eventRequests <- r.Method
+					location := targetServer.URL + "/admin"
+					if sameServer {
+						location = "/admin"
+					}
+					w.Header().Set("Location", location)
+					w.WriteHeader(status)
+				}))
+				defer eventServer.Close()
+
+				completed := make(chan struct{}, 1)
+				core := zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), zapcore.AddSync(io.Discard), zap.WarnLevel)
+				core = zapcore.RegisterHooks(core, func(entry zapcore.Entry) error {
+					if entry.Message == "Error response from Umami API" {
+						completed <- struct{}{}
+					}
+					return nil
+				})
+				module := Umami{
+					EventEndpoint:      eventServer.URL + "/send",
+					WebsiteUUID:        "test-website",
+					ReportAllResources: true,
+					logger:             zap.New(core),
+				}
+				request := httptest.NewRequest(http.MethodGet, "https://example.test/page", nil)
+				next := testHandler(func(http.ResponseWriter, *http.Request) error { return nil })
+				if err := module.ServeHTTP(httptest.NewRecorder(), request, next); err != nil {
+					t.Fatalf("serve request: %v", err)
+				}
+
+				select {
+				case <-completed:
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for analytics response")
+				}
+				select {
+				case method := <-eventRequests:
+					if method != http.MethodPost {
+						t.Errorf("event request method = %s, want POST", method)
+					}
+				default:
+					t.Error("analytics endpoint did not receive a request")
+				}
+				select {
+				case method := <-targetRequests:
+					t.Errorf("redirect target received a %s request", method)
+				default:
+				}
+			})
+		}
 	}
 }
 
