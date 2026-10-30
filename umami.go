@@ -224,7 +224,11 @@ func (p Umami) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 
 		visitorIP := p.GetClientIP(r)
 
-		client := &http.Client{}
+		client := &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 		req, err := http.NewRequest("POST", p.EventEndpoint, bytes.NewBuffer(body))
 		if err != nil {
 			p.logger.Error("Error creating request", zap.Error(err))

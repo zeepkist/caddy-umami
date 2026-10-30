@@ -28,7 +28,7 @@ umami [<matcher>] {
 }
 ```
 
-- **event_endpoint** (required) is the address of your Umami installation's send API endpoint
+- **event_endpoint** (required) is the address of your Umami installation's send API endpoint. Redirects are not followed; configure the final endpoint directly.
 - **website_uuid** (required) is the UUID of the website from your Umami dashboard
 - **allowed_extensions** is a list of extensions which indicate valid content.
   - Make sure to include `""` in this list if you want to track URLs which don't end in a file extension, such as `/` or `/about-us`
